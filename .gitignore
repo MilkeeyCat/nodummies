@@ -11,3 +11,7 @@ main.mod
 modules.order
 main.mod.o
 main.o
+.common.o.cmd
+.malloc.o.cmd
+common.o
+malloc.o

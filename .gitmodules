@@ -1,0 +1,3 @@
+[submodule "ddnet_protocol"]
+	path = ddnet_protocol
+	url = https://github.com/MilkeeyCat/ddnet_protocol
