@@ -1,66 +1,117 @@
-#include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/skbuff.h>
-#include <linux/if_packet.h>
-#include <linux/if_ether.h>
-#include <linux/netdevice.h>
 #include <linux/ip.h>
+#include <linux/kernel.h>
+#include <linux/kprobes.h>
+#include <linux/module.h>
 #include <linux/udp.h>
 
+#include <control_message.h>
+#include <packet.h>
+
 #define UDP_HLEN 8
+#define CLIENTS_LEN 16
 
-void hex_dump(uint8_t *data, size_t len) {
-    size_t rowsize = 16, li = 0, remaining = len, linelen;
+struct client {
+	pid_t pid;
+	uint16_t main;
+	uint16_t dummy;
+};
 
-    for (size_t i = 0, l = 0; i < len; i += rowsize) {
-        printk("%06ld\t", li);
-
-        linelen = min(remaining, rowsize);
-        remaining -= rowsize;
-
-        for (l = 0; l < linelen; l++) {
-            printk(KERN_CONT "%02X ", (uint32_t) data[l]);
-        }
-
-        data += linelen;
-        li += 10;
-
-        printk(KERN_CONT "\n");
-    }
-}
-
+struct client clients[CLIENTS_LEN];
 struct packet_type handler;
+struct kprobe kprobe = {
+	.symbol_name = "do_exit",
+};
 
 static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *og_dev) {
-    if (ip_hdr(skb)->protocol == IPPROTO_UDP) {
-        // That's little bit of magic because ethernet header is before data pointer?
-        uint8_t *data = skb->data + ip_hdr(skb)->ihl * 4 + UDP_HLEN;
-        // UDP's len includes header size
-        size_t len = ntohs(udp_hdr(skb)->len) - UDP_HLEN;
+	if(eth_hdr(skb)->h_proto == htons(ETH_P_IP) && ip_hdr(skb)->protocol == IPPROTO_UDP && skb->pkt_type == PACKET_OUTGOING) {
+		struct iphdr *iph = ip_hdr(skb);
+		struct udphdr *udph = (struct udphdr *)((uint8_t *)iph + iph->ihl * 4); // calculate the udp header by hand because `udp_hdr` function returns the same pointer as `ip_hdr`
+		uint8_t *data = (uint8_t *)udph + UDP_HLEN;
+		size_t len = skb->len;
 
-        printk("UDP payload:\n");
-        hex_dump(data, len);
-    }
+		if(len < PACKET_HEADER_SIZE || len > MAX_PACKET_SIZE) {
+			goto end;
+		}
 
-    kfree_skb(skb);
-    return 0;
+		PacketHeader header = decode_packet_header(data);
+
+		if(!(header.flags & PACKET_FLAG_CONTROL)) {
+			goto end;
+		}
+
+		uint8_t payload[MAX_PACKET_SIZE];
+		Error err = ERR_NONE;
+		size_t payload_len = get_packet_payload(&header, data, len, payload, sizeof(payload), &err);
+		if(err != ERR_NONE) {
+			goto end;
+		}
+
+		ControlMessage message = decode_control(payload, payload_len, &header, &err);
+		if(err != ERR_NONE || message.kind != CTRL_MSG_CONNECT) {
+			goto end;
+		}
+
+		for(size_t i = 0; i < CLIENTS_LEN; i++) {
+			if(clients[i].pid == current->pid) {
+				clients[i].dummy = udph->source;
+
+				goto end;
+			}
+		}
+
+		for(size_t i = 0; i < CLIENTS_LEN; i++) {
+			if(clients[i].pid == 0) {
+				clients[i].pid = current->pid;
+				clients[i].main = udph->source;
+
+				goto end;
+			}
+		}
+	}
+
+end:
+	kfree_skb(skb);
+	return 0;
+}
+
+static int __kprobes handler_pre(struct kprobe *kp, struct pt_regs *regs) {
+	for(size_t i = 0; i < CLIENTS_LEN; i++) {
+		if(clients[i].pid == current->pid) {
+			clients[i] = (struct client){};
+
+			break;
+		}
+	}
+
+	return 0;
 }
 
 static int __init nodummies_start(void) {
-    handler.type = htons(ETH_P_IP);
-    handler.dev = NULL;
-    handler.func = packet_rcv;
+	handler.type = htons(ETH_P_ALL); // for some reason ETH_P_IP doesn't give outgoing packets >:(
+	handler.dev = NULL;
+	handler.func = packet_rcv;
 
-    dev_add_pack(&handler);
+	kprobe.pre_handler = handler_pre;
+	kprobe.post_handler = NULL;
 
-    return 0;
+	int ret = register_kprobe(&kprobe);
+	if(ret < 0) {
+		printk("register_kprobe failed: %d\n", ret);
+
+		return ret;
+	}
+
+	dev_add_pack(&handler);
+	printk("nodummies: started\n");
+
+	return 0;
 }
 
 static void __exit nodummies_end(void) {
-    printk(KERN_INFO "Bye, world!");
-
-    dev_remove_pack(&handler);
+	unregister_kprobe(&kprobe);
+	dev_remove_pack(&handler);
+	printk("nodummies: exited\n");
 }
 
 module_init(nodummies_start);
