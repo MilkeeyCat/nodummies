@@ -1,16 +1,16 @@
+#include <ddnet_protocol/control_message.h>
+#include <ddnet_protocol/fetch_chunks.h>
+#include <ddnet_protocol/huffman.h>
+#include <ddnet_protocol/message.h>
+#include <ddnet_protocol/packet.h>
+#include <ddnet_protocol/token.h>
+
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/udp.h>
-
-#include <control_message.h>
-#include <fetch_chunks.h>
-#include <huffman.h>
-#include <message.h>
-#include <packet.h>
-#include <token.h>
 
 #define UDP_HLEN 8
 #define CLIENTS_LEN 16
@@ -22,7 +22,7 @@ struct client {
 };
 
 struct packet {
-	uint8_t buf[MAX_PACKET_SIZE];
+	uint8_t buf[DDPROTO_MAX_PACKET_SIZE];
 	uint8_t *cur;
 	bool had_input;
 };
@@ -33,16 +33,16 @@ struct kprobe kprobe = {
 	.symbol_name = "do_exit",
 };
 
-static void on_message(void *ctx, Chunk *chunk) {
+static void on_message(void *ctx, DDProtoChunk *chunk) {
 	struct packet *packet = ctx;
 
-	if(chunk->kind == CHUNK_KIND_INPUT) {
-		int32_t dir = chunk->msg.input.direction;
+	if(chunk->payload.kind == DDPROTO_MSG_KIND_INPUT) {
+		int32_t dir = chunk->payload.msg.input.direction;
 
 		if(dir == 1) {
-			chunk->msg.input.direction = -1;
+			chunk->payload.msg.input.direction = -1;
 		} else if(dir == -1) {
-			chunk->msg.input.direction = 1;
+			chunk->payload.msg.input.direction = 1;
 		}
 
 		if(packet->had_input == false) {
@@ -50,9 +50,9 @@ static void on_message(void *ctx, Chunk *chunk) {
 		}
 	}
 
-	packet->cur = encode_chunk_header(&chunk->header, packet->cur);
-	Error err = ERR_NONE;
-	packet->cur += encode_message(chunk, packet->cur, &err);
+	packet->cur += ddproto_encode_chunk_header(&chunk->header, packet->cur);
+	DDProtoError err = DDPROTO_ERR_NONE;
+	packet->cur += ddproto_encode_message(chunk, packet->cur, &err);
 }
 
 static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *og_dev) {
@@ -62,26 +62,31 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet
 		uint8_t *data = (uint8_t *)udph + UDP_HLEN;
 		size_t len = skb->len - (data - skb->data);
 
-		if(len < PACKET_HEADER_SIZE || len > MAX_PACKET_SIZE) {
+		if(len < DDPROTO_PACKET_HEADER_SIZE || len > DDPROTO_MAX_PACKET_SIZE) {
 			goto end;
 		}
 
-		PacketHeader header = decode_packet_header(data);
-		uint8_t payload[MAX_PACKET_SIZE];
-		Error err = ERR_NONE;
-		size_t payload_len = get_packet_payload(&header, data, len, payload, sizeof(payload), &err);
-		if(err != ERR_NONE) {
+		DDProtoPacketHeader header = ddproto_decode_packet_header(data);
+		uint8_t payload[DDPROTO_MAX_PACKET_SIZE];
+		DDProtoError err = DDPROTO_ERR_NONE;
+		size_t payload_len = ddproto_get_packet_payload(&header, data, len, payload, sizeof(payload), &err);
+		if(err != DDPROTO_ERR_NONE) {
 			goto end;
 		}
 
-		if(header.flags & PACKET_FLAG_CONTROL) {
-			ControlMessage message = decode_control(payload, payload_len, &header, &err);
-			if(err != ERR_NONE || message.kind != CTRL_MSG_CONNECT) {
+		if(header.flags & DDPROTO_PACKET_FLAG_CONTROL) {
+			DDProtoControlMessage message;
+            size_t size = ddproto_decode_control(payload, payload_len, &message, &err);
+			if(err != DDPROTO_ERR_NONE || message.kind != DDPROTO_CTRL_MSG_CONNECT) {
 				goto end;
 			}
 
+            header.token = ddproto_read_token(payload + size);
+
 			for(size_t i = 0; i < CLIENTS_LEN; i++) {
-				if(clients[i].pid == current->pid) {
+                // second condition is there because connect control message is
+                // sent every 500ms
+				if(clients[i].pid == current->pid && clients[i].main != udph->source) {
 					clients[i].dummy = udph->source;
 
 					goto end;
@@ -96,25 +101,30 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet
 					goto end;
 				}
 			}
-		} else if(!(header.flags & PACKET_FLAG_CONNLESS)) {
+		} else if(!(header.flags & DDPROTO_PACKET_FLAG_CONNLESS)) {
 			for(size_t i = 0; i < CLIENTS_LEN; i++) {
 				if(clients[i].pid == current->pid && clients[i].dummy == udph->source) {
 					struct packet packet = {
 						.had_input = false,
 					};
 					packet.cur = packet.buf;
+                    DDProtoError err = DDPROTO_ERR_NONE;
+					size_t size = ddproto_fetch_chunks(payload, payload_len, &header, on_message, &packet, &err);
+                    if(err != DDPROTO_ERR_NONE) {
+                        goto end;
+                    }
 
-					fetch_chunks(payload, payload_len, &header, on_message, &packet);
-					write_token(header.token, packet.cur);
-					packet.cur += sizeof(Token);
+                    header.token = ddproto_read_token(payload + size);
+					ddproto_write_token(header.token, packet.cur);
+					packet.cur += sizeof(DDProtoToken);
 
 					if(packet.had_input) {
-						encode_packet_header(&header, data);
-						data += PACKET_HEADER_SIZE;
+						ddproto_encode_packet_header(&header, data);
+						data += DDPROTO_PACKET_HEADER_SIZE;
 
-						if(header.flags & PACKET_FLAG_COMPRESSION) {
-							Error err = ERR_NONE;
-							huffman_compress(packet.buf, packet.cur - packet.buf, data, len - PACKET_HEADER_SIZE, &err);
+						if(header.flags & DDPROTO_PACKET_FLAG_COMPRESSION) {
+							DDProtoError err = DDPROTO_ERR_NONE;
+							ddproto_huffman_compress(packet.buf, packet.cur - packet.buf, data, len - DDPROTO_PACKET_HEADER_SIZE, &err);
 						} else {
 							memcpy(data, packet.buf, packet.cur - packet.buf);
 						}
