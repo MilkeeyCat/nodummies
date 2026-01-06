@@ -76,16 +76,16 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet
 
 		if(header.flags & DDPROTO_PACKET_FLAG_CONTROL) {
 			DDProtoControlMessage message;
-            size_t size = ddproto_decode_control(payload, payload_len, &message, &err);
+			size_t size = ddproto_decode_control(payload, payload_len, &message, &err);
 			if(err != DDPROTO_ERR_NONE || message.kind != DDPROTO_CTRL_MSG_CONNECT) {
 				goto end;
 			}
 
-            header.token = ddproto_read_token(payload + size);
+			header.token = ddproto_read_token(payload + size);
 
 			for(size_t i = 0; i < CLIENTS_LEN; i++) {
-                // second condition is there because connect control message is
-                // sent every 500ms
+				// second condition is there because connect control message is
+				// sent every 500ms
 				if(clients[i].pid == current->pid && clients[i].main != udph->source) {
 					clients[i].dummy = udph->source;
 
@@ -108,13 +108,13 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet
 						.had_input = false,
 					};
 					packet.cur = packet.buf;
-                    DDProtoError err = DDPROTO_ERR_NONE;
+					DDProtoError err = DDPROTO_ERR_NONE;
 					size_t size = ddproto_fetch_chunks(payload, payload_len, &header, on_message, &packet, &err);
-                    if(err != DDPROTO_ERR_NONE) {
-                        goto end;
-                    }
+					if(err != DDPROTO_ERR_NONE) {
+						goto end;
+					}
 
-                    header.token = ddproto_read_token(payload + size);
+					header.token = ddproto_read_token(payload + size);
 					ddproto_write_token(header.token, packet.cur);
 					packet.cur += sizeof(DDProtoToken);
 

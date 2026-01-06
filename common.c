@@ -2,9 +2,9 @@
 #include <linux/slab.h>
 
 void *malloc(size_t size) {
-    return kmalloc(size, GFP_USER);
+	return kmalloc(size, GFP_USER);
 }
 
 void free(void *ptr) {
-    kfree(ptr);
+	kfree(ptr);
 }
