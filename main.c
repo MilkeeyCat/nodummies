@@ -5,6 +5,7 @@
 #include <ddnet_protocol/packet.h>
 #include <ddnet_protocol/token.h>
 
+#include <asm/fpu/api.h>
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
@@ -109,7 +110,13 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet
 					};
 					packet.cur = packet.buf;
 					DDProtoError err = DDPROTO_ERR_NONE;
+					// newer kernels have `kernel_fpu_available` which should be
+					// equal to true before calling `kernel_fpu_begin` but in my
+					// kernel's version it's not present ¯\_(ツ)_/¯
+					// https://docs.kernel.org/core-api/floating-point.html
+					kernel_fpu_begin();
 					size_t size = ddproto_fetch_chunks(payload, payload_len, &header, on_message, &packet, &err);
+					kernel_fpu_end();
 					if(err != DDPROTO_ERR_NONE) {
 						goto end;
 					}
